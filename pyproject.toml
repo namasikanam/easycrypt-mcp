@@ -1,0 +1,15 @@
+[project]
+name = "easycrypt-mcp"
+version = "0.1.0"
+description = "Model Context Protocol server for EasyCrypt"
+requires-python = ">=3.9"
+dependencies = [
+    "mcp",
+    "pexpect",
+]
+
+[tool.setuptools]
+py-modules = ["easycrypt_mcp"]
+
+[project.scripts]
+easycrypt-mcp = "easycrypt_mcp:mcp.run"

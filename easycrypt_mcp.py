@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """MCP server for EasyCrypt.
 
-Tools:
-  compile    — Compile a file, optionally stopping at a line/column to show goals.
-  search     — Search for lemmas by pattern.
-  locate     — Locate where a name is defined.
-  print      — Print the definition of a name.
-  file_outline — List top-level declarations in a file with line numbers.
+Two interaction modes, distinguished by tool-name prefix:
+
+  Compile mode (ec_* tools) — stateless, one-shot subprocess calls.
+    ec_compile      — Compile a whole file and report success or errors.
+    ec_print_goals  — Compile up to a position and print proof goals.
+    ec_file_outline — List top-level declarations with line numbers.
+
+  Interactive mode (cli_* tools) — persistent REPL session.
+    cli_open    — Open a file and process up to a given line.
+    cli_step    — Send a command to the REPL and append it to the file.
+    cli_undo    — Jump back to the state at a given line (undo steps).
+    cli_search  — Search for lemmas by pattern in the current session.
+    cli_print   — Print a definition in the current session.
+    cli_locate  — Locate where a name is defined in the current session.
+    cli_close   — Close the session and terminate the REPL.
 """
 
 import os
@@ -22,63 +31,99 @@ PROMPT_RE = r"\[(\d+)\|([a-z]+)\]>"
 
 mcp = FastMCP("easycrypt")
 
+
 # ---------------------------------------------------------------
-# Background REPL (lazy-initialized)
+# Shared helpers
 # ---------------------------------------------------------------
-
-_repl: Optional[pexpect.spawn] = None
-_repl_imports: set[str] = set()
-
-
-def _ensure_repl() -> pexpect.spawn:
-    global _repl
-    if _repl is None or not _repl.isalive():
-        _repl = pexpect.spawn(
-            EC_BIN, ["cli", "-emacs"], encoding="utf-8", timeout=60,
-        )
-        _repl.setecho(False)
-        _repl.expect(PROMPT_RE)
-        _repl_imports.clear()
-    return _repl
-
-
-def _repl_send(command: str) -> str:
-    repl = _ensure_repl()
-    repl.sendline(command)
-    repl.expect(PROMPT_RE)
-    return repl.before.strip()
-
-
-def _repl_require(theory: str) -> Optional[str]:
-    """Require-import a theory if not already loaded. Returns error or None."""
-    if theory in _repl_imports:
-        return None
-    raw = _repl_send(f"require import {theory}.")
-    if "[error-" in raw:
-        return f"ERROR loading {theory}: {_parse_repl_output(raw)}"
-    _repl_imports.add(theory)
-    return None
-
 
 def _parse_repl_output(raw: str) -> str:
     lines = []
     for line in raw.splitlines():
-        if line.startswith("[W]"):
+        # Skip banner lines (normal mode: ">> ...", emacs mode: "[W]...")
+        if line.startswith(">> ") or line.startswith("[W]"):
             continue
-        # Skip standalone marker lines ("+", "|", "*")
         if line.strip() in ("+", "|", "*"):
-            continue
-        m = re.match(r"\[error-\d+-\d+\](.*)", line)
-        if m:
-            lines.append(f"ERROR: {m.group(1)}")
             continue
         lines.append(line)
     return "\n".join(lines).strip()
 
 
-# ---------------------------------------------------------------
-# compile
-# ---------------------------------------------------------------
+def _parse_sentences(text: str) -> list[tuple[str, int]]:
+    """Parse EasyCrypt text into sentences terminated by '.'.
+
+    Returns a list of (sentence, end_line) tuples where end_line is the
+    1-based line number of the terminating '.'.
+    Handles nested comments (* ... *) and string literals "...".
+    """
+    sentences: list[tuple[str, int]] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+    line = 1
+    comment_depth = 0
+    in_string = False
+
+    while i < n:
+        ch = text[i]
+
+        if ch == "\n":
+            line += 1
+            buf.append(ch)
+            i += 1
+            continue
+
+        if in_string:
+            buf.append(ch)
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == "(" and i + 1 < n and text[i + 1] == "*":
+            comment_depth += 1
+            buf.append(ch)
+            buf.append("*")
+            i += 2
+            continue
+
+        if ch == "*" and i + 1 < n and text[i + 1] == ")" and comment_depth > 0:
+            comment_depth -= 1
+            buf.append(ch)
+            buf.append(")")
+            i += 2
+            continue
+
+        if comment_depth > 0:
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            buf.append(ch)
+            i += 1
+            continue
+
+        if ch == ".":
+            next_i = i + 1
+            if next_i >= n or text[next_i] in (" ", "\t", "\n", "\r", ")"):
+                buf.append(ch)
+                sentence = "".join(buf).strip()
+                if sentence:
+                    sentences.append((sentence, line))
+                buf = []
+                i = next_i
+                continue
+
+        buf.append(ch)
+        i += 1
+
+    return sentences
+
+
+# ===============================================================
+# Compile mode (ec_* tools) — stateless subprocess calls
+# ===============================================================
 
 def _run_compile(
     file_path: str,
@@ -95,20 +140,14 @@ def _run_compile(
         args, capture_output=True, text=True, timeout=timeout,
     )
 
-    # stdout has goal output (from -upto or -lastgoals)
     output = (result.stdout or "").strip()
 
-    # stderr has progress bars, stack traces, and error messages.
-    # Error lines look like: [critical] [file: line N ...] message
-    # or (with -script): E critical file: line N ...
     errors = []
     for line in (result.stderr or "").splitlines():
-        # Non-script format: [critical] or [error] markers
         m = re.match(r"\s*\[(critical|error)\]\s*(.*)", line)
         if m:
             errors.append(f"{m.group(1)}: {m.group(2)}")
             continue
-        # -script format
         if line.startswith("E critical") or line.startswith("E error"):
             errors.append(line)
 
@@ -145,7 +184,7 @@ def ec_compile(
 
 
 @mcp.tool()
-def print_goals(
+def ec_print_goals(
     file_path: str,
     line: int,
     column: Optional[int] = None,
@@ -153,6 +192,8 @@ def print_goals(
 ) -> str:
     """Compile an EasyCrypt file up to a given position and print all open
     proof goals at that point.
+
+    Stateless — every call reprocesses from scratch.
 
     Args:
         file_path: Path to the .ec file
@@ -174,105 +215,15 @@ def print_goals(
     return "\n\n".join(parts)
 
 
-# ---------------------------------------------------------------
-# search / locate / print  (REPL-backed)
-# ---------------------------------------------------------------
-
-def _require_theories(theories: Optional[list[str]]) -> Optional[str]:
-    """Require-import a list of theories. Returns first error or None."""
-    if not theories:
-        return None
-    for theory in theories:
-        err = _repl_require(theory)
-        if err:
-            return err
-    return None
-
-
 @mcp.tool()
-def ec_search(pattern: str, theories: Optional[list[str]] = None) -> str:
-    """Search for lemmas matching a pattern.
-
-    Use _ as a wildcard. Examples: "(_ + 0)", "(_ * (_ + _))".
-
-    Args:
-        pattern: Search pattern
-        theories: Theories to load first (e.g., ["Int", "List"])
-    """
-    err = _require_theories(theories)
-    if err:
-        return err
-    raw = _repl_send(f"search {pattern}.")
-    return _parse_repl_output(raw) or "No results found."
-
-
-@mcp.tool()
-def ec_locate(name: str, theories: Optional[list[str]] = None) -> str:
-    """Locate where a name is defined (which theory/module).
-
-    Args:
-        name: Name to locate (e.g., "addzC", "map")
-        theories: Theories to load first (e.g., ["Int", "List"])
-    """
-    err = _require_theories(theories)
-    if err:
-        return err
-    raw = _repl_send(f"locate {name}.")
-    return _parse_repl_output(raw) or f"Could not locate '{name}'."
-
-
-@mcp.tool()
-def ec_print(name: str, theories: Optional[list[str]] = None) -> str:
-    """Print the definition of a type, operator, lemma, or axiom.
-
-    The theory is auto-loaded from the qualified name (e.g., "Int.addz0"
-    auto-requires Int). Additional theories can be passed explicitly.
-
-    Args:
-        name: Qualified name (e.g., "Int.addz0", "List.map", "int")
-        theories: Extra theories to load first (e.g., ["IntDiv"])
-    """
-    # Auto-require from qualified prefix
-    parts = name.split(".")
-    if len(parts) >= 2:
-        auto = [parts[0]]
-        if theories:
-            auto = auto + [t for t in theories if t != parts[0]]
-        theories = auto
-    err = _require_theories(theories)
-    if err:
-        return err
-    raw = _repl_send(f"print {name}.")
-    return _parse_repl_output(raw) or f"No definition found for '{name}'."
-
-
-# ---------------------------------------------------------------
-# file_outline
-# ---------------------------------------------------------------
-
-# Top-level keyword patterns that start declarations.
-# Each tuple: (regex, label, name-capture-group-index-or-None)
-_OUTLINE_PATTERNS = [
-    (re.compile(r"^\s*(lemma|axiom|schema)\s+(\w+)"), None, 2),
-    (re.compile(r"^\s*(op|pred|abbrev)\s+(\[.*?\]\s+)?(\w+)"), None, 3),
-    (re.compile(r"^\s*(type)\s+(\w+)"), None, 2),
-    (re.compile(r"^\s*(module)\s+(type\s+)?(\w+)"), "module type" if None else None, 3),
-    (re.compile(r"^\s*(theory|section)\s+(\w+)"), None, 2),
-    (re.compile(r"^\s*(clone)\s+(?:import\s+|export\s+)?(\S+)"), None, 2),
-    (re.compile(r"^\s*(require)\s+(?:import\s+|export\s+)?(.+?)\.?\s*$"), None, 2),
-    (re.compile(r"^\s*(realize)\s+(\w+)"), None, 2),
-    (re.compile(r"^\s*(instance)\s+(\w+)"), None, 2),
-]
-
-
-@mcp.tool()
-def ec_file_outline(file_path: str) -> str:
+def ec_file_outline(file_path: str, upto_line: Optional[int] = None) -> str:
     """List top-level declarations in an EasyCrypt file with line numbers.
 
     Returns one line per declaration: "LINE_NUMBER KIND NAME"
 
     Args:
         file_path: Path to the .ec file
+        upto_line: Optional line number; only show declarations up to this line
     """
     try:
         with open(file_path) as f:
@@ -280,18 +231,31 @@ def ec_file_outline(file_path: str) -> str:
     except OSError as e:
         return f"ERROR: {e}"
 
+    _OUTLINE_PATTERNS = [
+        (re.compile(r"^\s*(lemma|axiom|schema)\s+(\w+)"), None, 2),
+        (re.compile(r"^\s*(op|pred|abbrev)\s+(\[.*?\]\s+)?(\w+)"), None, 3),
+        (re.compile(r"^\s*(type)\s+(\w+)"), None, 2),
+        (re.compile(r"^\s*(module)\s+(type\s+)?(\w+)"), None, 3),
+        (re.compile(r"^\s*(theory|section)\s+(\w+)"), None, 2),
+        (re.compile(r"^\s*(clone)\s+(?:import\s+|export\s+)?(\S+)"), None, 2),
+        (re.compile(r"^\s*(require)\s+(?:import\s+|export\s+)?(.+?)\.?\s*$"), None, 2),
+        (re.compile(r"^\s*(realize)\s+(\w+)"), None, 2),
+        (re.compile(r"^\s*(instance)\s+(\w+)"), None, 2),
+    ]
+
+    max_line = upto_line if upto_line is not None else len(lines)
+
     entries = []
     for lineno, line in enumerate(lines, 1):
-        # Skip lines inside proofs (indented tactic lines)
+        if lineno > max_line:
+            break
         stripped = line.rstrip()
         if not stripped or stripped.startswith("(*"):
             continue
-
         for pattern, label_override, name_group in _OUTLINE_PATTERNS:
             m = pattern.match(line)
             if m:
                 kind = label_override or m.group(1)
-                # Detect "module type" specifically
                 if kind == "module" and m.group(2) and "type" in m.group(2):
                     kind = "module type"
                 name = m.group(name_group)
@@ -301,6 +265,323 @@ def ec_file_outline(file_path: str) -> str:
     if not entries:
         return "No declarations found."
     return "\n".join(entries)
+
+
+# ===============================================================
+# Interactive mode (cli_* tools) — persistent REPL session
+# ===============================================================
+
+# Session state
+_cli_repl: Optional[pexpect.spawn] = None
+_cli_path: Optional[str] = None
+_cli_original_lines: list[str] = []    # file content at open time (as lines)
+_cli_sentences: list[tuple[str, int]] = []  # parsed from current file content
+_cli_sent_idx: int = 0                 # sentences fed to REPL so far
+_cli_last_output: str = ""
+_cli_insert_after: int = 0            # 0-based line index: steps insert after this
+_cli_step_texts: list[str] = []       # text of each step, in order
+
+
+def _cli_reset() -> None:
+    global _cli_repl, _cli_path, _cli_original_lines, _cli_sentences
+    global _cli_sent_idx, _cli_last_output, _cli_insert_after, _cli_step_texts
+    if _cli_repl is not None and _cli_repl.isalive():
+        _cli_repl.close()
+    _cli_repl = None
+    _cli_path = None
+    _cli_original_lines = []
+    _cli_sentences = []
+    _cli_sent_idx = 0
+    _cli_last_output = ""
+    _cli_insert_after = 0
+    _cli_step_texts = []
+
+
+def _cli_start_repl() -> pexpect.spawn:
+    global _cli_repl
+    if _cli_repl is not None and _cli_repl.isalive():
+        _cli_repl.close()
+    _cli_repl = pexpect.spawn(
+        EC_BIN, ["cli"], encoding="utf-8", timeout=120,
+    )
+    _cli_repl.setecho(False)
+    _cli_repl.expect(PROMPT_RE)
+    return _cli_repl
+
+
+def _cli_feed_until(target_line: int) -> tuple[str, int]:
+    """Feed sentences to the REPL up to target_line.
+
+    Returns (raw_output, processed_line) where processed_line is the
+    end_line of the last sentence that was fed to the REPL.
+    """
+    global _cli_sent_idx, _cli_last_output
+    repl = _cli_repl
+    assert repl is not None
+
+    last_output = _cli_last_output
+    processed_line = 0
+    # If we already fed some sentences, the last one's end_line is our baseline
+    if _cli_sent_idx > 0 and _cli_sent_idx <= len(_cli_sentences):
+        processed_line = _cli_sentences[_cli_sent_idx - 1][1]
+
+    while _cli_sent_idx < len(_cli_sentences):
+        sentence, end_line = _cli_sentences[_cli_sent_idx]
+        if end_line > target_line:
+            break
+        repl.sendline(sentence)
+        repl.expect(PROMPT_RE)
+        last_output = repl.before.strip()
+        processed_line = end_line
+        _cli_sent_idx += 1
+        if "<tty>:" in last_output:
+            break
+
+    _cli_last_output = last_output
+    return last_output, processed_line
+
+
+def _cli_send(command: str) -> str:
+    """Send a single command to the REPL.  Returns raw output."""
+    repl = _cli_repl
+    assert repl is not None
+    repl.sendline(command)
+    repl.expect(PROMPT_RE)
+    return repl.before.strip()
+
+
+def _cli_current_file_lines() -> list[str]:
+    """Reconstruct the current file content (original + steps)."""
+    lines = _cli_original_lines.copy()
+    # Insert step texts after _cli_insert_after
+    offset = _cli_insert_after
+    for text in _cli_step_texts:
+        step_lines = text.splitlines(keepends=True)
+        # Ensure last line has newline
+        if step_lines and not step_lines[-1].endswith("\n"):
+            step_lines[-1] += "\n"
+        for sl in step_lines:
+            lines.insert(offset, sl)
+            offset += 1
+    return lines
+
+
+def _cli_write_file() -> None:
+    """Write the reconstructed file to disk."""
+    lines = _cli_current_file_lines()
+    with open(_cli_path, "w") as f:
+        f.writelines(lines)
+
+
+def _cli_reparse_and_replay(target_line: int) -> tuple[str, int]:
+    """Restart REPL, re-parse current file, replay up to target_line."""
+    global _cli_sentences, _cli_sent_idx, _cli_last_output
+    content = "".join(_cli_current_file_lines())
+    _cli_sentences = _parse_sentences(content)
+    _cli_sent_idx = 0
+    _cli_last_output = ""
+    _cli_start_repl()
+    return _cli_feed_until(target_line)
+
+
+@mcp.tool()
+def cli_open(
+    file_path: str,
+    line: int,
+) -> str:
+    """Open an EasyCrypt file and process it up to a given line.
+
+    Starts a fresh interactive REPL session.  Subsequent cli_step, cli_undo,
+    cli_search, cli_print, and cli_locate calls operate in this session.
+
+    Args:
+        file_path: Path to the .ec file
+        line: Line number to process up to
+    """
+    file_path = os.path.realpath(file_path)
+    _cli_reset()
+
+    global _cli_path, _cli_original_lines, _cli_sentences
+    global _cli_insert_after, _cli_step_texts
+
+    try:
+        with open(file_path) as f:
+            _cli_original_lines = f.readlines()
+    except OSError as e:
+        return f"ERROR: {e}"
+
+    _cli_path = file_path
+    content = "".join(_cli_original_lines)
+    _cli_sentences = _parse_sentences(content)
+    _cli_insert_after = line  # steps will insert after this 1-based line (0-based index = line)
+    _cli_step_texts = []
+
+    _cli_start_repl()
+    raw, processed_line = _cli_feed_until(line)
+    output = _parse_repl_output(raw) or "No open goals."
+    return f"[line {processed_line}] {output}"
+
+
+@mcp.tool()
+def cli_step(
+    input: str,
+) -> str:
+    """Send a command to the interactive REPL and append it to the file.
+
+    The input (e.g., a tactic like "split." or "trivial.") is sent to the
+    REPL and inserted into the file after the current position.
+
+    Requires an open session (cli_open).
+
+    Args:
+        input: EasyCrypt command to execute (e.g., "split.", "trivial.")
+    """
+    if _cli_repl is None or not _cli_repl.isalive():
+        return "ERROR: no open session.  Call cli_open first."
+
+    global _cli_sent_idx, _cli_last_output, _cli_insert_after
+
+    # Send to REPL
+    raw = _cli_send(input)
+    _cli_last_output = raw
+
+    # If rejected, don't modify the file
+    if "<tty>:" in raw:
+        output = _parse_repl_output(raw)
+        return f"[line {_cli_insert_after}] {output}"
+
+    # Track the step and update insertion point
+    text = input if input.endswith("\n") else input + "\n"
+    _cli_step_texts.append(text)
+    _cli_insert_after += text.count("\n")
+
+    # Update sentence list to include the new step
+    content = "".join(_cli_current_file_lines())
+    _cli_sentences = _parse_sentences(content)
+    _cli_sent_idx += 1  # we already sent this sentence to the REPL
+
+    # Write file
+    _cli_write_file()
+
+    step_line = _cli_insert_after
+    output = _parse_repl_output(raw) or "No open goals."
+    return f"[line {step_line}] {output}"
+
+
+@mcp.tool()
+def cli_undo(
+    line: int,
+) -> str:
+    """Undo interactive steps back to the state at a given line.
+
+    Removes any step-added content after the target line, restarts the
+    REPL, and replays up to that line.
+
+    Requires an open session (cli_open).
+
+    Args:
+        line: Line number to jump back to
+    """
+    if _cli_path is None:
+        return "ERROR: no open session.  Call cli_open first."
+
+    global _cli_step_texts, _cli_insert_after
+
+    # Figure out how many step lines to keep.
+    # Steps were inserted starting at the original _cli_insert_after position.
+    # We need to find which steps fit within the target line.
+    original_insert = _cli_insert_after - sum(
+        t.count("\n") for t in _cli_step_texts
+    )
+    if line <= original_insert:
+        # Undo all steps
+        _cli_step_texts = []
+        _cli_insert_after = original_insert
+    else:
+        # Keep steps whose lines fit within target
+        kept = []
+        cursor = original_insert
+        for text in _cli_step_texts:
+            step_lines = text.count("\n")
+            if cursor + step_lines <= line:
+                kept.append(text)
+                cursor += step_lines
+            else:
+                break
+        _cli_step_texts = kept
+        _cli_insert_after = cursor
+
+    # Rewrite file and replay
+    _cli_write_file()
+    raw, processed_line = _cli_reparse_and_replay(line)
+    output = _parse_repl_output(raw) or "No open goals."
+    return f"[line {processed_line}] {output}"
+
+
+@mcp.tool()
+def cli_search(pattern: str) -> str:
+    """Search for lemmas matching a pattern in the current interactive session.
+
+    Uses the file session's REPL, so all theories loaded by the file are
+    available.
+
+    Requires an open session (cli_open).
+
+    Args:
+        pattern: Search pattern (use _ as wildcard, e.g., "(_ + 0)")
+    """
+    if _cli_repl is None or not _cli_repl.isalive():
+        return "ERROR: no open session.  Call cli_open first."
+    raw = _cli_send(f"search {pattern}.")
+    return _parse_repl_output(raw) or "No results found."
+
+
+@mcp.tool()
+def cli_print(name: str) -> str:
+    """Print the definition of a name in the current interactive session.
+
+    Uses the file session's REPL, so all theories loaded by the file are
+    available.
+
+    Requires an open session (cli_open).
+
+    Args:
+        name: Name to print (e.g., "addz0", "List.map")
+    """
+    if _cli_repl is None or not _cli_repl.isalive():
+        return "ERROR: no open session.  Call cli_open first."
+    raw = _cli_send(f"print {name}.")
+    return _parse_repl_output(raw) or f"No definition found for '{name}'."
+
+
+@mcp.tool()
+def cli_locate(name: str) -> str:
+    """Locate where a name is defined in the current interactive session.
+
+    Uses the file session's REPL, so all theories loaded by the file are
+    available.
+
+    Requires an open session (cli_open).
+
+    Args:
+        name: Name to locate (e.g., "addzC", "map")
+    """
+    if _cli_repl is None or not _cli_repl.isalive():
+        return "ERROR: no open session.  Call cli_open first."
+    raw = _cli_send(f"locate {name}.")
+    return _parse_repl_output(raw) or f"Could not locate '{name}'."
+
+
+@mcp.tool()
+def cli_close() -> str:
+    """Close the current interactive session.
+
+    Terminates the REPL process and clears all session state.
+    """
+    if _cli_repl is None and _cli_path is None:
+        return "No open session."
+    _cli_reset()
+    return "Session closed."
 
 
 if __name__ == "__main__":
