@@ -1,6 +1,6 @@
 ## Prerequisite
 
-* `easycrypt` with options `-lastgoals` and `-upto`: https://github.com/namasikanam/easycrypt
+* `easycrypt` with options `-lastgoals` (print last unproven goals) and `-upto` (compile up to a position in a file): https://github.com/namasikanam/easycrypt
 * Python 3.11+
 * [uv](https://docs.astral.sh/uv/getting-started/installation/): a Python package manager
 
