@@ -7,7 +7,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(__file__))
 from easycrypt_mcp import (
-    ec_compile, ec_search, ec_locate, ec_print, ec_file_outline,
+    ec_compile, print_goals, ec_search, ec_locate, ec_print, ec_file_outline,
     _repl, _repl_imports,
 )
 
@@ -57,64 +57,64 @@ check("compile failure", r,
       ("mentions error", "cannot save" in r or "critical" in r.lower()))
 os.unlink(path)
 
-# 3. Compile with -upto showing goals
-path = write_tmp("lemma foo : true /\\ true.\nproof.\n  split.\n  trivial.\n  trivial.\nqed.\n")
-# Remove .eco cache
-eco = os.path.splitext(path)[0] + ".eco"
-if os.path.exists(eco):
-    os.unlink(eco)
-r = ec_compile(path, line=3, column=5)
-check("compile -upto with goals", r,
-      ("starts with OK", r.startswith("OK")),
-      ("shows goal", "true" in r.lower()),
-      ("shows remaining", "remaining" in r.lower() or "Goal #2" in r))
-os.unlink(path)
-if os.path.exists(eco):
-    os.unlink(eco)
-
-# 4. Compile with -upto past end (proof already done)
-path = write_tmp("lemma foo : true = true.\nproof.\n  trivial.\nqed.\n")
-eco = os.path.splitext(path)[0] + ".eco"
-if os.path.exists(eco):
-    os.unlink(eco)
-r = ec_compile(path, line=4)
-check("compile -upto past proof", r,
-      ("starts with OK", r.startswith("OK")))
-os.unlink(path)
-if os.path.exists(eco):
-    os.unlink(eco)
-
-# 5. Compile nonexistent file
+# 3. Compile nonexistent file
 r = ec_compile("/nonexistent/file.ec")
 check("compile nonexistent", r,
       ("fails", "FAILED" in r or "ERROR" in r or r.startswith("FAILED")))
 
-# 6. Compile with syntax error
+# 4. Compile with syntax error
 path = write_tmp("lemma foo : .\n")
 r = ec_compile(path)
 check("compile syntax error", r,
       ("fails", "FAILED" in r))
 os.unlink(path)
 
-# 7. Compile with -upto line=1 (before any command)
-path = write_tmp("lemma foo : true = true.\nproof.\n  trivial.\nqed.\n")
+# ---------------------------------------------------------------
+# print_goals
+# ---------------------------------------------------------------
+print("\n=== print_goals ===")
+
+# 5. Print goals with line and column
+path = write_tmp("lemma foo : true /\\ true.\nproof.\n  split.\n  trivial.\n  trivial.\nqed.\n")
 eco = os.path.splitext(path)[0] + ".eco"
 if os.path.exists(eco):
     os.unlink(eco)
-r = ec_compile(path, line=1)
-check("compile -upto line 1", r,
-      ("starts with OK", r.startswith("OK")))
+r = print_goals(path, line=3, column=5)
+check("print_goals with goals", r,
+      ("shows goal", "true" in r.lower()),
+      ("no FAILED", "FAILED" not in r))
 os.unlink(path)
 if os.path.exists(eco):
     os.unlink(eco)
 
-# 8. Compile with column but no line (column should be ignored)
-path = write_tmp("lemma foo : true = true.\nproof. trivial. qed.\n")
-r = ec_compile(path, column=5)
-check("compile column-only (no line)", r,
-      ("starts with OK", r.startswith("OK")),
+# 6. Print goals past end (proof already done)
+path = write_tmp("lemma foo : true = true.\nproof.\n  trivial.\nqed.\n")
+eco = os.path.splitext(path)[0] + ".eco"
+if os.path.exists(eco):
+    os.unlink(eco)
+r = print_goals(path, line=4)
+check("print_goals past proof", r,
       ("no FAILED", "FAILED" not in r))
 os.unlink(path)
+if os.path.exists(eco):
+    os.unlink(eco)
+
+# 7. Print goals at line 1 (before any command)
+path = write_tmp("lemma foo : true = true.\nproof.\n  trivial.\nqed.\n")
+eco = os.path.splitext(path)[0] + ".eco"
+if os.path.exists(eco):
+    os.unlink(eco)
+r = print_goals(path, line=1)
+check("print_goals line 1", r,
+      ("no FAILED", "FAILED" not in r))
+os.unlink(path)
+if os.path.exists(eco):
+    os.unlink(eco)
+
+# 8. Print goals on nonexistent file
+r = print_goals("/nonexistent/file.ec", line=1)
+check("print_goals nonexistent", r,
+      ("fails", "FAILED" in r or "ERROR" in r))
 
 # ---------------------------------------------------------------
 # ec_file_outline

@@ -17,10 +17,7 @@ from typing import Optional
 import pexpect
 from mcp.server.fastmcp import FastMCP
 
-EC_BIN = os.environ.get(
-    "EASYCRYPT_BIN",
-    os.path.join(os.path.dirname(__file__), "..", "ec.native"),
-)
+EC_BIN = os.environ.get("EASYCRYPT_BIN", "easycrypt")
 PROMPT_RE = r"\[(\d+)\|([a-z]+)\]>"
 
 mcp = FastMCP("easycrypt")
@@ -126,35 +123,48 @@ def _run_compile(
 @mcp.tool()
 def ec_compile(
     file_path: str,
-    line: Optional[int] = None,
-    column: Optional[int] = None,
     timeout: int = 120,
 ) -> str:
-    """Compile an EasyCrypt file.
-
-    Without line/column: compiles the whole file and reports success or errors.
-    With line (and optional column): compiles up to that position, then prints
-    all open proof goals at that point.
-
-    On failure, shows the error message and the blocking goal state.
+    """Compile an EasyCrypt file and report success or errors.
 
     Args:
         file_path: Path to the .ec file
-        line: Optional line number to stop at and show goals
-        column: Optional column number (requires line)
         timeout: Timeout in seconds (default: 120)
     """
-    upto = None
-    if line is not None:
-        upto = str(line) if column is None else f"{line}:{column}"
+    r = _run_compile(file_path, timeout=timeout)
 
+    if r["success"]:
+        return "OK"
+
+    parts = ["FAILED"]
+    if r["errors"]:
+        parts.append("\n".join(r["errors"]))
+    if r["output"]:
+        parts.append(r["output"])
+    return "\n\n".join(parts)
+
+
+@mcp.tool()
+def print_goals(
+    file_path: str,
+    line: int,
+    column: Optional[int] = None,
+    timeout: int = 120,
+) -> str:
+    """Compile an EasyCrypt file up to a given position and print all open
+    proof goals at that point.
+
+    Args:
+        file_path: Path to the .ec file
+        line: Line number to stop at
+        column: Optional column number for finer positioning
+        timeout: Timeout in seconds (default: 120)
+    """
+    upto = str(line) if column is None else f"{line}:{column}"
     r = _run_compile(file_path, upto=upto, timeout=timeout)
 
     if r["success"]:
-        if r["output"]:
-            # -upto prints goals to stdout
-            return f"OK\n\n{r['output']}"
-        return "OK"
+        return r["output"] if r["output"] else "No open goals."
 
     parts = ["FAILED"]
     if r["errors"]:
