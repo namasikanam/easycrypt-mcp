@@ -274,27 +274,20 @@ def ec_file_outline(file_path: str, upto_line: Optional[int] = None) -> str:
 # Session state
 _cli_repl: Optional[pexpect.spawn] = None
 _cli_path: Optional[str] = None
-_cli_original_lines: list[str] = []    # file content at open time (as lines)
-_cli_sentences: list[tuple[str, int]] = []  # parsed from current file content
-_cli_sent_idx: int = 0                 # sentences fed to REPL so far
-_cli_last_output: str = ""
-_cli_insert_after: int = 0            # 0-based line index: steps insert after this
-_cli_step_texts: list[str] = []       # text of each step, in order
+_cli_lines: list[str] = []       # current file content as lines
+_cli_open_line: int = 0          # line passed to cli_open (minimum for undo)
+_cli_cursor: int = 0             # 1-based line: last processed line
 
 
 def _cli_reset() -> None:
-    global _cli_repl, _cli_path, _cli_original_lines, _cli_sentences
-    global _cli_sent_idx, _cli_last_output, _cli_insert_after, _cli_step_texts
+    global _cli_repl, _cli_path, _cli_lines, _cli_open_line, _cli_cursor
     if _cli_repl is not None and _cli_repl.isalive():
         _cli_repl.close()
     _cli_repl = None
     _cli_path = None
-    _cli_original_lines = []
-    _cli_sentences = []
-    _cli_sent_idx = 0
-    _cli_last_output = ""
-    _cli_insert_after = 0
-    _cli_step_texts = []
+    _cli_lines = []
+    _cli_open_line = 0
+    _cli_cursor = 0
 
 
 def _cli_start_repl() -> pexpect.spawn:
@@ -310,34 +303,34 @@ def _cli_start_repl() -> pexpect.spawn:
 
 
 def _cli_feed_until(target_line: int) -> tuple[str, int]:
-    """Feed sentences to the REPL up to target_line.
+    """Feed sentences parsed from _cli_lines to the REPL up to target_line.
 
-    Returns (raw_output, processed_line) where processed_line is the
-    end_line of the last sentence that was fed to the REPL.
+    Returns (raw_output, processed_line).
     """
-    global _cli_sent_idx, _cli_last_output
+    global _cli_cursor
     repl = _cli_repl
     assert repl is not None
 
-    last_output = _cli_last_output
-    processed_line = 0
-    # If we already fed some sentences, the last one's end_line is our baseline
-    if _cli_sent_idx > 0 and _cli_sent_idx <= len(_cli_sentences):
-        processed_line = _cli_sentences[_cli_sent_idx - 1][1]
+    content = "".join(_cli_lines)
+    sentences = _parse_sentences(content)
 
-    while _cli_sent_idx < len(_cli_sentences):
-        sentence, end_line = _cli_sentences[_cli_sent_idx]
+    last_output = ""
+    processed_line = _cli_cursor
+
+    # Skip sentences already processed (end_line <= _cli_cursor)
+    for sentence, end_line in sentences:
+        if end_line <= _cli_cursor:
+            continue
         if end_line > target_line:
             break
         repl.sendline(sentence)
         repl.expect(PROMPT_RE)
         last_output = repl.before.strip()
         processed_line = end_line
-        _cli_sent_idx += 1
         if "<tty>:" in last_output:
             break
 
-    _cli_last_output = last_output
+    _cli_cursor = processed_line
     return last_output, processed_line
 
 
@@ -350,36 +343,16 @@ def _cli_send(command: str) -> str:
     return repl.before.strip()
 
 
-def _cli_current_file_lines() -> list[str]:
-    """Reconstruct the current file content (original + steps)."""
-    lines = _cli_original_lines.copy()
-    # Insert step texts after _cli_insert_after
-    offset = _cli_insert_after
-    for text in _cli_step_texts:
-        step_lines = text.splitlines(keepends=True)
-        # Ensure last line has newline
-        if step_lines and not step_lines[-1].endswith("\n"):
-            step_lines[-1] += "\n"
-        for sl in step_lines:
-            lines.insert(offset, sl)
-            offset += 1
-    return lines
-
-
 def _cli_write_file() -> None:
-    """Write the reconstructed file to disk."""
-    lines = _cli_current_file_lines()
+    """Write _cli_lines to disk."""
     with open(_cli_path, "w") as f:
-        f.writelines(lines)
+        f.writelines(_cli_lines)
 
 
-def _cli_reparse_and_replay(target_line: int) -> tuple[str, int]:
-    """Restart REPL, re-parse current file, replay up to target_line."""
-    global _cli_sentences, _cli_sent_idx, _cli_last_output
-    content = "".join(_cli_current_file_lines())
-    _cli_sentences = _parse_sentences(content)
-    _cli_sent_idx = 0
-    _cli_last_output = ""
+def _cli_replay_to(target_line: int) -> tuple[str, int]:
+    """Restart REPL and replay up to target_line."""
+    global _cli_cursor
+    _cli_cursor = 0
     _cli_start_repl()
     return _cli_feed_until(target_line)
 
@@ -401,20 +374,16 @@ def cli_open(
     file_path = os.path.realpath(file_path)
     _cli_reset()
 
-    global _cli_path, _cli_original_lines, _cli_sentences
-    global _cli_insert_after, _cli_step_texts
+    global _cli_path, _cli_lines, _cli_open_line
 
     try:
         with open(file_path) as f:
-            _cli_original_lines = f.readlines()
+            _cli_lines = f.readlines()
     except OSError as e:
         return f"ERROR: {e}"
 
     _cli_path = file_path
-    content = "".join(_cli_original_lines)
-    _cli_sentences = _parse_sentences(content)
-    _cli_insert_after = line  # steps will insert after this 1-based line (0-based index = line)
-    _cli_step_texts = []
+    _cli_open_line = line
 
     _cli_start_repl()
     raw, processed_line = _cli_feed_until(line)
@@ -439,33 +408,28 @@ def cli_step(
     if _cli_repl is None or not _cli_repl.isalive():
         return "ERROR: no open session.  Call cli_open first."
 
-    global _cli_sent_idx, _cli_last_output, _cli_insert_after
+    global _cli_cursor
 
     # Send to REPL
     raw = _cli_send(input)
-    _cli_last_output = raw
 
     # If rejected, don't modify the file
     if "<tty>:" in raw:
         output = _parse_repl_output(raw)
-        return f"[line {_cli_insert_after}] {output}"
+        return f"[line {_cli_cursor}] {output}"
 
-    # Track the step and update insertion point
+    # Insert the text into _cli_lines after _cli_cursor
     text = input if input.endswith("\n") else input + "\n"
-    _cli_step_texts.append(text)
-    _cli_insert_after += text.count("\n")
+    new_lines = text.splitlines(keepends=True)
+    insert_at = _cli_cursor  # 0-based index = 1-based line
+    for i, nl in enumerate(new_lines):
+        _cli_lines.insert(insert_at + i, nl)
+    _cli_cursor += len(new_lines)
 
-    # Update sentence list to include the new step
-    content = "".join(_cli_current_file_lines())
-    _cli_sentences = _parse_sentences(content)
-    _cli_sent_idx += 1  # we already sent this sentence to the REPL
-
-    # Write file
     _cli_write_file()
 
-    step_line = _cli_insert_after
     output = _parse_repl_output(raw) or "No open goals."
-    return f"[line {step_line}] {output}"
+    return f"[line {_cli_cursor}] {output}"
 
 
 @mcp.tool()
@@ -485,35 +449,14 @@ def cli_undo(
     if _cli_path is None:
         return "ERROR: no open session.  Call cli_open first."
 
-    global _cli_step_texts, _cli_insert_after
+    # Clamp: cannot undo before the line passed to cli_open
+    if line < _cli_open_line:
+        line = _cli_open_line
 
-    # Figure out how many step lines to keep.
-    # Steps were inserted starting at the original _cli_insert_after position.
-    # We need to find which steps fit within the target line.
-    original_insert = _cli_insert_after - sum(
-        t.count("\n") for t in _cli_step_texts
-    )
-    if line <= original_insert:
-        # Undo all steps
-        _cli_step_texts = []
-        _cli_insert_after = original_insert
-    else:
-        # Keep steps whose lines fit within target
-        kept = []
-        cursor = original_insert
-        for text in _cli_step_texts:
-            step_lines = text.count("\n")
-            if cursor + step_lines <= line:
-                kept.append(text)
-                cursor += step_lines
-            else:
-                break
-        _cli_step_texts = kept
-        _cli_insert_after = cursor
-
-    # Rewrite file and replay
+    # Truncate _cli_lines to target line and replay
+    _cli_lines[:] = _cli_lines[:line]
     _cli_write_file()
-    raw, processed_line = _cli_reparse_and_replay(line)
+    raw, processed_line = _cli_replay_to(line)
     output = _parse_repl_output(raw) or "No open goals."
     return f"[line {processed_line}] {output}"
 

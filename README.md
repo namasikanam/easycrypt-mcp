@@ -20,8 +20,6 @@ claude mcp add -s user easycrypt-mcp uvx easycrypt-mcp
 claude mcp add -s user easycrypt-mcp uvx easycrypt-mcp
 ```
 
-TODO: VSCode / Cursor / Mistral Vibe
-
 ## Tools
 
 The intended way of using this MCP is to write a proof skeleton (lemmas with admitted) in compile mode, and prove each `admit` in the interactive mode one by one.
@@ -40,9 +38,14 @@ In interactive mode, the agent opens
 
 - `cli_open(file_path, line)`: open an interactive session at a specific line. If the compilation up to this line fails, the failing line number and the proof goals there should be returned.
 - `cli_step(input)`: send a tactic command to proceed on the current goal. If the input tactic can be sucessfully applied, it will be inserted into the file; if the tactic is rejected, it will not be written.
-- `cli_undo(line)`: jump back to a given line, the undo-ed steps should be discarded.
+- `cli_undo(line)`: jump back to a given line, the undo-ed steps should be discarded. Note that the behavior of `undo` does not exactly match the `undo` command in cli, as the granulariy of this MCP is line-level.
 - `cli_locate(name)`: find which theory contains this definition
 - `cli_print(name)`: print a definition
 - `cli_search(pattern)`: search lemmas satisfying a given pattern
 - `cli_close()`: close the interactive session
+
+## Plan
+
+- [ ] LSP for EC
+- [ ] support VSCode, Cursor, and Mistral Vibe
 

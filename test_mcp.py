@@ -315,6 +315,21 @@ check("cli_undo: file restored", content,
       ("no trivial", "trivial" not in content))
 os.unlink(path)
 
+# 16b. Undo to before open line is clamped to open line
+path = write_tmp("require import Int.\nlemma baz : true /\\ true.\nproof.\n")
+r = cli_open(path, line=3)
+r = cli_step("  split.")
+r = cli_undo(line=1)  # before open line=3, should clamp to 3
+check("cli_undo: clamp to open line", r,
+      ("line 3", "[line 3]" in r),
+      ("shows original goal", "true" in r.lower()))
+# Verify steps were removed
+with open(path) as f:
+    content = f.read()
+check("cli_undo: clamped file restored", content,
+      ("no split", "split" not in content))
+os.unlink(path)
+
 
 # ===============================================================
 # Interactive mode: cli_search / cli_print / cli_locate
