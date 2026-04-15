@@ -8,7 +8,7 @@
 
 Step 1: install this project as a package.
 ```
-uv pip install --system -e .
+uv pip3 install --system -e .
 ```
 
 Step 2: add this mcp to Claude Code.

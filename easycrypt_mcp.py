@@ -36,6 +36,24 @@ mcp = FastMCP("easycrypt")
 # Shared helpers
 # ---------------------------------------------------------------
 
+def _repl_rejected(raw: str) -> bool:
+    """Return True if the REPL output indicates the command was rejected.
+
+    EasyCrypt uses at least two error formats in CLI mode:
+      - ``<tty>:LINE:COL-COL: Error: ...``  (parse / unknown-command errors)
+      - ``[error] ...`` / ``[critical] ...`` (semantic errors such as SMT
+        failure, qed on an incomplete proof, etc.)
+    Both must be treated as rejection so the step is NOT written to disk.
+    """
+    if "<tty>:" in raw:
+        return True
+    for line in raw.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("[error]") or stripped.startswith("[critical]"):
+            return True
+    return False
+
+
 def _parse_repl_output(raw: str) -> str:
     lines = []
     for line in raw.splitlines():
@@ -274,31 +292,45 @@ def ec_file_outline(file_path: str, upto_line: Optional[int] = None) -> str:
 # Session state
 _cli_repl: Optional[pexpect.spawn] = None
 _cli_path: Optional[str] = None
-_cli_lines: list[str] = []       # current file content as lines
-_cli_open_line: int = 0          # line passed to cli_open (minimum for undo)
-_cli_cursor: int = 0             # 1-based line: last processed line
+_cli_head: list[str] = []       # lines up to (and including) cursor; steps append here
+_cli_tail: list[str] = []       # original lines after open_line; preserved across steps/undo
+_cli_open_line: int = 0         # line passed to cli_open (minimum for undo)
+_cli_cursor: int = 0            # 1-based line: last processed line = len(_cli_head)
 
 
 def _cli_reset() -> None:
-    global _cli_repl, _cli_path, _cli_lines, _cli_open_line, _cli_cursor
+    global _cli_repl, _cli_path, _cli_head, _cli_tail, _cli_open_line, _cli_cursor
     if _cli_repl is not None and _cli_repl.isalive():
-        _cli_repl.close()
+        _cli_repl.kill(9)
     _cli_repl = None
     _cli_path = None
-    _cli_lines = []
+    _cli_head = []
+    _cli_tail = []
     _cli_open_line = 0
     _cli_cursor = 0
+
+
+def _cli_expect_prompt(repl: pexpect.spawn, context: str = "") -> None:
+    """Wait for the REPL prompt.  On timeout, raise with diagnostic info."""
+    try:
+        repl.expect(PROMPT_RE)
+    except pexpect.TIMEOUT:
+        received = repl.before or ""
+        raise TimeoutError(
+            f"REPL timed out{' (' + context + ')' if context else ''}. "
+            f"Received so far: {received!r}"
+        )
 
 
 def _cli_start_repl() -> pexpect.spawn:
     global _cli_repl
     if _cli_repl is not None and _cli_repl.isalive():
-        _cli_repl.close()
+        _cli_repl.kill(9)
     _cli_repl = pexpect.spawn(
         EC_BIN, ["cli"], encoding="utf-8", timeout=120,
     )
     _cli_repl.setecho(False)
-    _cli_repl.expect(PROMPT_RE)
+    _cli_expect_prompt(_cli_repl, "start")
     return _cli_repl
 
 
@@ -311,7 +343,7 @@ def _cli_feed_until(target_line: int) -> tuple[str, int]:
     repl = _cli_repl
     assert repl is not None
 
-    content = "".join(_cli_lines)
+    content = "".join(_cli_head)
     sentences = _parse_sentences(content)
 
     last_output = ""
@@ -324,10 +356,10 @@ def _cli_feed_until(target_line: int) -> tuple[str, int]:
         if end_line > target_line:
             break
         repl.sendline(sentence)
-        repl.expect(PROMPT_RE)
+        _cli_expect_prompt(repl, f"line {end_line}: {sentence[:60]}")
         last_output = repl.before.strip()
         processed_line = end_line
-        if "<tty>:" in last_output:
+        if _repl_rejected(last_output):
             break
 
     _cli_cursor = processed_line
@@ -339,14 +371,15 @@ def _cli_send(command: str) -> str:
     repl = _cli_repl
     assert repl is not None
     repl.sendline(command)
-    repl.expect(PROMPT_RE)
+    _cli_expect_prompt(repl, f"command: {command[:60]}")
     return repl.before.strip()
 
 
 def _cli_write_file() -> None:
-    """Write _cli_lines to disk."""
+    """Write _cli_head + _cli_tail to disk."""
     with open(_cli_path, "w") as f:
-        f.writelines(_cli_lines)
+        f.writelines(_cli_head)
+        f.writelines(_cli_tail)
 
 
 def _cli_replay_to(target_line: int) -> tuple[str, int]:
@@ -374,19 +407,24 @@ def cli_open(
     file_path = os.path.realpath(file_path)
     _cli_reset()
 
-    global _cli_path, _cli_lines, _cli_open_line
+    global _cli_path, _cli_head, _cli_tail, _cli_open_line
 
     try:
         with open(file_path) as f:
-            _cli_lines = f.readlines()
+            all_lines = f.readlines()
     except OSError as e:
         return f"ERROR: {e}"
 
     _cli_path = file_path
     _cli_open_line = line
+    _cli_head = all_lines[:line]
+    _cli_tail = all_lines[line:]
 
-    _cli_start_repl()
-    raw, processed_line = _cli_feed_until(line)
+    try:
+        _cli_start_repl()
+        raw, processed_line = _cli_feed_until(line)
+    except TimeoutError as e:
+        return f"ERROR: {e}"
     output = _parse_repl_output(raw) or "No open goals."
     return f"[line {processed_line}] {output}"
 
@@ -411,20 +449,20 @@ def cli_step(
     global _cli_cursor
 
     # Send to REPL
-    raw = _cli_send(input)
+    try:
+        raw = _cli_send(input)
+    except TimeoutError as e:
+        return f"ERROR: {e}"
 
     # If rejected, don't modify the file
-    if "<tty>:" in raw:
+    if _repl_rejected(raw):
         output = _parse_repl_output(raw)
         return f"[line {_cli_cursor}] {output}"
 
-    # Insert the text into _cli_lines after _cli_cursor
+    # Append to _cli_head
     text = input if input.endswith("\n") else input + "\n"
-    new_lines = text.splitlines(keepends=True)
-    insert_at = _cli_cursor  # 0-based index = 1-based line
-    for i, nl in enumerate(new_lines):
-        _cli_lines.insert(insert_at + i, nl)
-    _cli_cursor += len(new_lines)
+    _cli_head.extend(text.splitlines(keepends=True))
+    _cli_cursor = len(_cli_head)
 
     _cli_write_file()
 
@@ -453,10 +491,13 @@ def cli_undo(
     if line < _cli_open_line:
         line = _cli_open_line
 
-    # Truncate _cli_lines to target line and replay
-    _cli_lines[:] = _cli_lines[:line]
+    # Truncate _cli_head to target line (tail is preserved)
+    _cli_head[:] = _cli_head[:line]
     _cli_write_file()
-    raw, processed_line = _cli_replay_to(line)
+    try:
+        raw, processed_line = _cli_replay_to(line)
+    except TimeoutError as e:
+        return f"ERROR: {e}"
     output = _parse_repl_output(raw) or "No open goals."
     return f"[line {processed_line}] {output}"
 
@@ -475,7 +516,10 @@ def cli_search(pattern: str) -> str:
     """
     if _cli_repl is None or not _cli_repl.isalive():
         return "ERROR: no open session.  Call cli_open first."
-    raw = _cli_send(f"search {pattern}.")
+    try:
+        raw = _cli_send(f"search {pattern}.")
+    except TimeoutError as e:
+        return f"ERROR: {e}"
     return _parse_repl_output(raw) or "No results found."
 
 
@@ -493,7 +537,10 @@ def cli_print(name: str) -> str:
     """
     if _cli_repl is None or not _cli_repl.isalive():
         return "ERROR: no open session.  Call cli_open first."
-    raw = _cli_send(f"print {name}.")
+    try:
+        raw = _cli_send(f"print {name}.")
+    except TimeoutError as e:
+        return f"ERROR: {e}"
     return _parse_repl_output(raw) or f"No definition found for '{name}'."
 
 
@@ -511,7 +558,10 @@ def cli_locate(name: str) -> str:
     """
     if _cli_repl is None or not _cli_repl.isalive():
         return "ERROR: no open session.  Call cli_open first."
-    raw = _cli_send(f"locate {name}.")
+    try:
+        raw = _cli_send(f"locate {name}.")
+    except TimeoutError as e:
+        return f"ERROR: {e}"
     return _parse_repl_output(raw) or f"Could not locate '{name}'."
 
 

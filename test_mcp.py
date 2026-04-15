@@ -330,6 +330,33 @@ check("cli_undo: clamped file restored", content,
       ("no split", "split" not in content))
 os.unlink(path)
 
+# 16c. File tail is preserved after step and undo
+path = write_tmp("lemma foo : true /\\ true.\nproof.\n  admit.\nqed.\n")
+r = cli_open(path, line=2)  # open at "proof.", tail = ["  admit.\n", "qed.\n"]
+r = cli_step("  split.")
+with open(path) as f:
+    content = f.read()
+check("cli_step: tail preserved", content,
+      ("has admit", "admit" in content),
+      ("has qed", "qed" in content),
+      ("has split", "split" in content))
+r = cli_undo(line=2)
+with open(path) as f:
+    content = f.read()
+check("cli_undo: tail preserved", content,
+      ("has admit", "admit" in content),
+      ("has qed", "qed" in content),
+      ("no split", "split" not in content))
+r = cli_step("  split.")
+cli_close()
+with open(path) as f:
+    content = f.read()
+check("cli_close: tail preserved", content,
+      ("has admit", "admit" in content),
+      ("has qed", "qed" in content),
+      ("has split", "split" in content))
+os.unlink(path)
+
 
 # ===============================================================
 # Interactive mode: cli_search / cli_print / cli_locate
